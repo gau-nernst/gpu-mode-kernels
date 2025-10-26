@@ -1,0 +1,6 @@
+line-length = 120
+extend-exclude = ["reference.py", "task.py", "a2a/"]
+
+[lint]
+extend-select = ["I"]
+extend-ignore = ["F401"]
