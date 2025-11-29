@@ -14,9 +14,6 @@ constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
 __device__ __host__
 constexpr int cdiv(int a, int b) { return (a + b - 1) / b; }
 
-__align__(16)
-struct u8x16 { uint8_t x[16]; };
-
 __global__
 void kernel(
   const uint8_t *data_ptr,    // (size,)
@@ -48,10 +45,12 @@ void kernel(
   const int num_iters = actual_size / wave_size;
   for (int iter_id = 0; iter_id < num_iters; iter_id++) {
     const int offset = bid * size_per_block + (iter_id * TB_SIZE + tid) * 16;
-    const u8x16 x = reinterpret_cast<const u8x16 *>(data_ptr + offset)[0];
+    const int4 tmp = reinterpret_cast<const int4 *>(data_ptr + offset)[0];
+    uint8_t x[16];
+    std::memcpy(x, &tmp, 16);
 
     for (int elem_id = 0; elem_id < 16; elem_id++) {
-      const int val = x.x[elem_id];  // cast u8->i32
+      const int val = x[elem_id];  // cast u8->i32
       atomicAdd(smem_hist + (warp_id * NUM_BINS + val), 1);
     }
   }
