@@ -1,0 +1,441 @@
+#!POPCORN leaderboard nvfp4_gemm
+#!POPCORN gpu NVIDIA
+
+import torch
+from task import input_t, output_t
+from torch.utils.cpp_extension import load_inline
+
+CUDA_SRC = r"""
+#include <cudaTypedefs.h>
+#include <cuda_fp16.h>
+
+#include <torch/library.h>
+#include <ATen/core/Tensor.h>
+
+constexpr int WARP_SIZE = 32;
+constexpr int NUM_WARPS = 4;
+constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
+
+constexpr int BLOCK_M = 128;
+constexpr int BLOCK_N = 128;
+constexpr int MMA_K = 64;  // 32 bytes
+
+__device__ inline
+constexpr uint64_t desc_encode(uint64_t x) { return (x & 0x3'FFFFULL) >> 4ULL; };
+
+// https://github.com/NVIDIA/cutlass/blob/v4.2.1/include/cute/arch/cluster_sm90.hpp#L180
+__device__
+uint32_t elect_sync() {
+  uint32_t pred = 0;
+  asm volatile(
+    "{\n\t"
+    ".reg .pred %%px;\n\t"
+    "elect.sync _|%%px, %1;\n\t"
+    "@%%px mov.s32 %0, 1;\n\t"
+    "}"
+    : "+r"(pred)
+    : "r"(0xFFFFFFFF)
+  );
+  return pred;
+}
+
+__device__ inline
+void mbarrier_init(int mbar_addr, int count) {
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"(mbar_addr), "r"(count));
+}
+
+// https://github.com/NVIDIA/cutlass/blob/v4.2.1/include/cutlass/arch/barrier.h#L408
+__device__
+void mbarrier_wait(int mbar_addr, int phase) {
+  uint32_t ticks = 0x989680;  // this is optional
+  asm volatile(
+    "{\n\t"
+    ".reg .pred P1;\n\t"
+    "LAB_WAIT:\n\t"
+    "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1, %2;\n\t"
+    "@P1 bra.uni DONE;\n\t"
+    "bra.uni LAB_WAIT;\n\t"
+    "DONE:\n\t"
+    "}"
+    :: "r"(mbar_addr), "r"(phase), "r"(ticks)
+  );
+}
+
+__device__ inline
+void tma_gmem2smem(int dst, const void *src, int size, int mbar_addr, uint64_t cache_policy) {
+  asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;"
+              :: "r"(dst), "l"(src), "r"(size), "r"(mbar_addr), "l"(cache_policy));
+}
+
+__device__ inline
+void tma_3d_gmem2smem(int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr, uint64_t cache_policy) {
+  asm volatile("cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.cta_group::1.L2::cache_hint "
+              "[%0], [%1, {%2, %3, %4}], [%5], %6;"
+              :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(mbar_addr), "l"(cache_policy)
+              : "memory");
+}
+
+__device__ inline
+void tcgen05_cp_nvfp4(int taddr, uint64_t s_desc) {
+  // .32x128b corresponds to (32, 16) 8-bit scale -> 1 MMA for nvfp4.
+  // .warpx4 duplicates data across 32-lane groups.
+  asm volatile("tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;" :: "r"(taddr), "l"(s_desc));
+}
+
+__device__ inline
+void tcgen05_mma_nvfp4(
+  uint64_t a_desc,
+  uint64_t b_desc,
+  uint32_t i_desc,
+  int scale_A_tmem,
+  int scale_B_tmem,
+  int enable_input_d
+) {
+  const int d_tmem = 0;  // assume
+  asm volatile(
+    "{\n\t"
+    ".reg .pred p;\n\t"  // predicate register enable-input-d
+    "setp.ne.b32 p, %6, 0;\n\t"
+    "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.block16 [%0], %1, %2, %3, [%4], [%5], p;\n\t"
+    "}"
+    :: "r"(d_tmem), "l"(a_desc), "l"(b_desc), "r"(i_desc),
+       "r"(scale_A_tmem), "r"(scale_B_tmem), "r"(enable_input_d)
+  );
+}
+
+template <int BLOCK_K, int NUM_STAGES>
+__global__
+__launch_bounds__(TB_SIZE)
+void kernel(
+  const __grid_constant__ CUtensorMap A_tmap,
+  const __grid_constant__ CUtensorMap B_tmap,
+  const char *SFA_ptr,
+  const char *SFB_ptr,
+  half *C_ptr,
+  int M, int N, int K
+) {
+  const int tid = threadIdx.x;
+  const int bid = blockIdx.x;
+
+  const int lane_id = tid % WARP_SIZE;
+  const int warp_id = tid / WARP_SIZE;
+
+  const int grid_m = M / BLOCK_M;
+  const int grid_n = N / BLOCK_N;
+  const int bid_m = bid / grid_n;
+  const int bid_n = bid % grid_n;
+
+  const int off_m = bid_m * BLOCK_M;
+  const int off_n = bid_n * BLOCK_N;
+
+  // set up smem
+  extern __shared__ __align__(1024) char smem_ptr[];
+  const int smem = static_cast<int>(__cvta_generic_to_shared(smem_ptr));
+  constexpr int A_size = BLOCK_M * BLOCK_K / 2;
+  constexpr int B_size = BLOCK_N * BLOCK_K / 2;
+  constexpr int SFA_size = BLOCK_M * BLOCK_K / 16;
+  constexpr int SFB_size = BLOCK_N * BLOCK_K / 16;
+  constexpr int STAGE_SIZE = A_size + B_size + SFA_size + SFB_size;
+
+  // set up mbarriers and tmem
+  // we have NUM_STAGES mbars for TMA
+  //         NUM_STAGES mbars for MMA
+  //                  1 mbar  for mainloop
+  #pragma nv_diag_suppress static_var_with_dynamic_init
+  __shared__ int64_t mbars[NUM_STAGES * 2 + 1];
+  const int tma_mbar_addr = static_cast<int>(__cvta_generic_to_shared(mbars));
+  const int mma_mbar_addr = tma_mbar_addr + NUM_STAGES * 8;
+  const int mainloop_mbar_addr = mma_mbar_addr + NUM_STAGES * 8;
+
+  // https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-scale-factor-a-layout-4x
+  // each MMA consumes (128, 64) of A and (128, 64) of B (we only handle BLOCK_N=128 for now)
+  // this requires (128, 4) of SFA and (128, 4) of SFB
+  // which are reshaped as (32, 4', 4) of SFA and (32, 4', 4) of SFB
+  // -> each MMA instruction requires 4 tmem columns of SFA and SFB each.
+  constexpr int SFA_tmem = BLOCK_N;
+  constexpr int SFB_tmem = SFA_tmem + 4 * (BLOCK_K / MMA_K);
+
+  if (warp_id == 0 && elect_sync()) {
+    // only 1 thread issue
+    for (int i = 0; i < NUM_STAGES * 2 + 1; i++)
+      mbarrier_init(tma_mbar_addr + i * 8, 1);
+    asm volatile("fence.mbarrier_init.release.cluster;");  // visible to async proxy
+  }
+  else if (warp_id == 1) {
+    // allocate tmem
+    // tmem address should be 0, don't bother storing and reading it.
+    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(smem), "r"(BLOCK_N * 2));
+  }
+  __syncthreads();  // visible to all threads
+
+  // TODO: make K constexpr as well
+  const int num_iters = K / BLOCK_K;
+
+  // warp-specialization
+  if (warp_id == 0 && elect_sync()) {
+    // TMA warp
+    int mma_phase = 1;  // init with 1, since it is initially available.
+
+    // https://github.com/NVIDIA/cutlass/blob/v4.3.2/include/cute/arch/copy_sm90_desc.hpp#L193-L197
+    uint64_t evict_first = 0x12F0000000000000;
+    uint64_t evict_last = 0x14F0000000000000;
+
+    for (int iter_k = 0; iter_k < num_iters; iter_k++) {
+      const int stage_id = iter_k % NUM_STAGES;
+
+      // wait MMA
+      mbarrier_wait(mma_mbar_addr + stage_id * 8, mma_phase);
+
+      // we have gone through all stages. flip the phase
+      if (stage_id == NUM_STAGES - 1)
+        mma_phase ^= 1;
+
+      const int mbar_addr = tma_mbar_addr + stage_id * 8;
+      const int A_smem = smem + stage_id * STAGE_SIZE;
+      const int B_smem = A_smem + A_size;
+      const int SFA_smem = B_smem + B_size;
+      const int SFB_smem = SFA_smem + SFA_size;
+
+      // issue TMA
+      const int off_k = iter_k * BLOCK_K;
+      tma_3d_gmem2smem(A_smem, &A_tmap, 0, off_m, off_k / 256, mbar_addr, evict_last);
+      tma_3d_gmem2smem(B_smem, &B_tmap, 0, off_n, off_k / 256, mbar_addr, evict_first);
+
+      // layout of SFA is [M/128, rest_k, 32, 4, 4]
+      //           SFB is [N/128, rest_k, 32, 4, 4]
+      const int rest_k = K / 16 / 4;
+      const char *SFA_src = SFA_ptr + (bid_m * rest_k + off_k / (16 * 4)) * 512;  // 512 = 32x4x4
+      const char *SFB_src = SFB_ptr + (bid_n * rest_k + off_k / (16 * 4)) * 512;
+      tma_gmem2smem(SFA_smem, SFA_src, SFA_size, mbar_addr, evict_last);
+      tma_gmem2smem(SFB_smem, SFB_src, SFB_size, mbar_addr, evict_first);
+
+      // signal TMA done
+      asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+                  :: "r"(mbar_addr), "r"(STAGE_SIZE) : "memory");
+    }
+  }
+  else if (warp_id == 1 && elect_sync()) {
+    // MMA warp
+    int tma_phase = 0;
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instruction-descriptor
+    constexpr uint32_t i_desc = (1U << 7U)   // atype=E2M1
+                              | (1U << 10U)  // btype=E2M1
+                              | ((uint32_t)BLOCK_N >> 3U << 17U)  // MMA_N
+                              | ((uint32_t)BLOCK_M >> 7U << 27U)  // MMA_M
+                              ;
+
+    for (int iter_k = 0; iter_k < num_iters; iter_k++) {
+      const int stage_id = iter_k % NUM_STAGES;
+
+      // wait TMA
+      mbarrier_wait(tma_mbar_addr + stage_id * 8, tma_phase);
+
+      // we have gone through all stages. flip the phase.
+      if (stage_id == NUM_STAGES - 1)
+        tma_phase ^= 1;
+
+      const int A_smem = smem + stage_id * STAGE_SIZE;
+      const int B_smem = A_smem + A_size;
+      const int SFA_smem = B_smem + B_size;
+      const int SFB_smem = SFA_smem + SFA_size;
+
+      // set up shared memory descriptors for A and B
+      // https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-shared-memory-descriptor
+      // 128-byte swizzling. LBO is implied to be 1.
+      auto make_desc_AB = [](int addr) -> uint64_t {
+        const int SBO = 8 * 128;
+        return desc_encode(addr) | (desc_encode(SBO) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+      };
+      // no swizzling
+      auto make_desc_SF = [](int addr) -> uint64_t {
+        const int SBO = 8 * 16;
+        return desc_encode(addr) | (desc_encode(SBO) << 32ULL) | (1ULL << 46ULL);
+      };
+
+      // tcgen05.cp -> tcgen05.mma should be pipelined correctly per PTX doc
+      // https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-memory-consistency-model-pipelined-instructions
+      // cutlass issues all of smem->tmem BEFORE mma
+      // https://github.com/NVIDIA/cutlass/blob/v4.3.2/include/cutlass/gemm/collective/sm100_blockscaled_mma_warpspecialized.hpp#L1013-L1016
+      for (int k = 0; k < BLOCK_K / MMA_K; k++) {
+        tcgen05_cp_nvfp4(SFA_tmem + k * 4, make_desc_SF(SFA_smem + k * 512));  // 4 columns, 512 bytes of 128x4 / 32x4x4
+        tcgen05_cp_nvfp4(SFB_tmem + k * 4, make_desc_SF(SFB_smem + k * 512));
+      }
+
+      // k1 selects the (BLOCK_M, 256) tile.
+      // k2 selects the (BLOCK_M, 64) tile, whose rows are swizzled.
+      for (int k1 = 0; k1 < BLOCK_K / 256; k1++)
+        for (int k2 = 0; k2 < 256 / MMA_K; k2++) {
+          uint64_t a_desc = make_desc_AB(A_smem + k1 * BLOCK_M * 128 + k2 * 32);
+          uint64_t b_desc = make_desc_AB(B_smem + k1 * BLOCK_N * 128 + k2 * 32);
+
+          int k_sf = k1 * 4 + k2;  // 4 is 256 / MMA_K
+          int enable_input_d = (k1 == 0 && k2 == 0) ? iter_k : 1;
+          tcgen05_mma_nvfp4(a_desc, b_desc, i_desc, SFA_tmem + k_sf * 4, SFB_tmem + k_sf * 4, enable_input_d);
+        }
+
+      // signal MMA done
+      asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
+                  :: "r"(mma_mbar_addr + stage_id * 8) : "memory");
+    }
+
+    // signal mainloop done
+    asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
+                :: "r"(mainloop_mbar_addr) : "memory");
+  }
+  __syncwarp();
+
+  // wait mainloop
+  mbarrier_wait(mainloop_mbar_addr, 0);
+  asm volatile("tcgen05.fence::after_thread_sync;");
+
+  // load 8 columns from tmem at a time -> store 16 bytes per thread to smem
+  // (still strided though)
+  for (int n = 0; n < BLOCK_N / 8; n++) {
+    float tmp[8];
+    // select tmem buffer
+    const int row = warp_id * 32;
+    const int col = n * 8;
+    const int addr = (row << 16) + col;
+    asm volatile("tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                : "=f"(tmp[0]), "=f"(tmp[1]), "=f"(tmp[2]), "=f"(tmp[3]),
+                  "=f"(tmp[4]), "=f"(tmp[5]), "=f"(tmp[6]), "=f"(tmp[7])
+                : "r"(addr));
+    asm volatile("tcgen05.wait::ld.sync.aligned;");
+
+    half2 out[4];
+    for (int i = 0; i < 4; i++)
+      out[i] = __float22half2_rn({tmp[i * 2], tmp[i * 2 + 1]});
+
+    // uncoalesced writes weeee
+    half *out_ptr = C_ptr + (off_m + tid) * N + (off_n + n * 8);
+    reinterpret_cast<int4 *>(out_ptr)[0] = reinterpret_cast<int4 *>(out)[0];
+  }
+
+  __syncthreads();  // everyone is done with tmem
+  if (warp_id == 0)  // deallocate tmem. tmem address should be 0.
+    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(0), "r"(BLOCK_N * 2));
+}
+
+void check_cu(CUresult err) {
+  if (err == CUDA_SUCCESS) return;
+  const char *error_msg_ptr;
+  if (cuGetErrorString(err, &error_msg_ptr) != CUDA_SUCCESS)
+    error_msg_ptr = "unable to get error string";
+  TORCH_CHECK(false, "cuTensorMapEncodeTiled error: ", error_msg_ptr);
+}
+
+void init_AB_tmap(
+  CUtensorMap *tmap,
+  const char *ptr,
+  uint64_t global_height, uint64_t global_width,
+  uint32_t shared_height, uint32_t shared_width
+) {
+  constexpr uint32_t rank = 3;
+  uint64_t globalDim[rank]       = {256, global_height, global_width / 256};
+  uint64_t globalStrides[rank-1] = {global_width / 2, 128};  // in bytes
+  uint32_t boxDim[rank]          = {256, shared_height, shared_width / 256};
+  uint32_t elementStrides[rank]  = {1, 1, 1};
+
+  auto err = cuTensorMapEncodeTiled(
+    tmap,
+    CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B,
+    rank,
+    (void *)ptr,
+    globalDim,
+    globalStrides,
+    boxDim,
+    elementStrides,
+    CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+    CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+    CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+    CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+  );
+  check_cu(err);
+}
+
+template <int BLOCK_K, int NUM_STAGES>
+void gemm_launch(
+  const char *A_ptr,
+  const char *B_ptr,
+  const char *SFA_ptr,
+  const char *SFB_ptr,
+        half *C_ptr,
+  int M, int N, int K
+) {
+  static_assert(BLOCK_K % 256 == 0);  // 128 bytes
+  CUtensorMap A_tmap, B_tmap;
+
+  // TODO: create tensormap once and cache it. replace address with cuTensorMapReplaceAddress()
+  init_AB_tmap(&A_tmap, A_ptr, M, K, BLOCK_M, BLOCK_K);
+  init_AB_tmap(&B_tmap, B_ptr, N, K, BLOCK_N, BLOCK_K);
+
+  int grid = (M / BLOCK_M) * (N / BLOCK_N);
+  int smem_size = (BLOCK_M + BLOCK_N) * (BLOCK_K / 2 + BLOCK_K / 16) * NUM_STAGES;
+
+  auto this_kernel = kernel<BLOCK_K, NUM_STAGES>;
+  if (smem_size > 48'000)
+    cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+  this_kernel<<<grid, TB_SIZE, smem_size>>>(A_tmap, B_tmap, SFA_ptr, SFB_ptr, C_ptr, M, N, K);
+}
+
+at::Tensor gemm(
+  const at::Tensor& A,
+  const at::Tensor& B,
+  const at::Tensor& SFA,
+  const at::Tensor& SFB,
+        at::Tensor& C
+) {
+  const int M = A.size(0);
+  const int N = B.size(0);
+  const int K = A.size(1) * 2;
+
+  auto A_ptr   = reinterpret_cast<const char *>(A.data_ptr());
+  auto B_ptr   = reinterpret_cast<const char *>(B.data_ptr());
+  auto SFA_ptr = reinterpret_cast<const char *>(SFA.data_ptr());
+  auto SFB_ptr = reinterpret_cast<const char *>(SFB.data_ptr());
+  auto C_ptr   = reinterpret_cast<half *>(C.data_ptr());
+
+  gemm_launch<256, 6>(A_ptr, B_ptr, SFA_ptr, SFB_ptr, C_ptr, M, N, K);
+  return C;
+}
+
+TORCH_LIBRARY(my_module, m) {
+  m.def("gemm(Tensor A, Tensor B, Tensor SFA, Tensor SFB, Tensor(a!) C) -> Tensor");
+  m.impl("gemm", &gemm);
+}
+"""
+
+load_inline(
+    "gemm",
+    cpp_sources="",
+    cuda_sources=CUDA_SRC,
+    verbose=True,
+    is_python_module=False,
+    no_implicit_headers=True,
+    extra_cuda_cflags=[
+        "-O3",
+        "-gencode=arch=compute_100a,code=sm_100a",
+        "--use_fast_math",
+        "--expt-relaxed-constexpr",
+        "--relocatable-device-code=false",
+        "-lineinfo",
+        "-Xptxas=-v",
+        # "--keep",
+        # "--keep-dir",
+        # f"{Path(__file__).parent}/tmp",
+    ],
+    extra_ldflags=[
+        "-lcuda",
+    ],
+)
+gemm = torch.ops.my_module.gemm
+
+
+def custom_kernel(data: input_t) -> output_t:
+    # a:   [M, K, 1],                     natural shape [1, M, K]
+    # b:   [N, K, 1],                     natural shape [1, N, K] - only the 1st row is used
+    # sfa: [32, 4, M/128, 4, rest_k, 1],  natural shape [1, M/128, rest_k, 32, 4, 4], where rest_k = K/16/4
+    # sfb: [32, 4, N/128, 4, rest_k, 1],  natural shape [1, N/128, rest_k, 32, 4, 4]
+    # c:   [M, N, 1],                     natural shape [1, M, N]
+    return gemm(data[0], data[1], data[4], data[5], data[6])
