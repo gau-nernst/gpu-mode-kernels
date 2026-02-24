@@ -18,8 +18,8 @@ __global__
 void kernel(
   const uint8_t *data_ptr,    // (size,)
         int64_t *output_ptr,  // (256,)
-        int size) {
-
+        int size
+) {
   const int tid = threadIdx.x;
   const int bid = blockIdx.x;
   const int num_blocks = gridDim.x;
@@ -46,12 +46,15 @@ void kernel(
   for (int iter_id = 0; iter_id < num_iters; iter_id++) {
     const int offset = bid * size_per_block + (iter_id * TB_SIZE + tid) * 16;
     const int4 tmp = reinterpret_cast<const int4 *>(data_ptr + offset)[0];
-    uint8_t x[16];
-    std::memcpy(x, &tmp, 16);
 
-    for (int elem_id = 0; elem_id < 16; elem_id++) {
-      const int val = x[elem_id];  // cast u8->i32
-      atomicAdd(smem_hist + (warp_id * NUM_BINS + val), 1);
+    // doing this is better than std::memcpy() to uint8_t[16]
+    // maybe just write unpack PTX directly
+    for (int i = 0; i < 4; i++) {
+      uchar4 tmp2 = reinterpret_cast<const uchar4 *>(&tmp)[i];
+      atomicAdd(smem_hist + (warp_id * NUM_BINS + (int)tmp2.x), 1);
+      atomicAdd(smem_hist + (warp_id * NUM_BINS + (int)tmp2.y), 1);
+      atomicAdd(smem_hist + (warp_id * NUM_BINS + (int)tmp2.z), 1);
+      atomicAdd(smem_hist + (warp_id * NUM_BINS + (int)tmp2.w), 1);
     }
   }
 
@@ -98,7 +101,7 @@ TORCH_LIBRARY(my_module, m) {
 """
 
 load_inline(
-    "histogram_v1",
+    "histogram_v2",
     cpp_sources="",
     cuda_sources=CUDA_SRC,
     verbose=True,
